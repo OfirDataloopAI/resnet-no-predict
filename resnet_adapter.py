@@ -20,26 +20,36 @@ from dtlpy.utilities.dataset_generators.dataset_generator_torch import DatasetGe
 logger = logging.getLogger('resnet-adapter')
 
 
+@dl.Package.decorators.module(name='model-adapter',
+                              description='Model Adapter for ResNet classification',
+                              init_inputs={'model_entity': dl.Model})
 class ModelAdapter(dl.BaseModelAdapter):
     """
     resnet Model adapter using pytorch.
-    The class bind Dataloop model and snapshot entities with model code implementation
+    The class bind Dataloop model and model entities with model code implementation
     """
 
-    def __init__(self, model_entity):
-        super(ModelAdapter, self).__init__(model_entity)
+    def __init__(self, model_entity=None):
+        if not isinstance(model_entity, dl.Model):
+            # pending fix DAT-31398
+            if isinstance(model_entity, str):
+                model_entity = dl.models.get(model_id=model_entity)
+            if isinstance(model_entity, dict) and 'model_id' in model_entity:
+                model_entity = dl.models.get(model_id=model_entity['model_id'])
+
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        super(ModelAdapter, self).__init__(model_entity=model_entity)
 
     def load(self, local_path, **kwargs):
         """ Loads model and populates self.model with a `runnable` model
 
             Virtual method - need to implement
 
-            This function is called by load_from_snapshot (download to local and then loads)
+            This function is called by load_from_model (download to local and then loads)
 
         :param local_path: `str` directory path in local FileSystem
         """
-        weights_filename = self.snapshot.configuration.get('weights_filename', 'model.pth')
+        weights_filename = self.model_entity.configuration.get('weights_filename', 'model.pth')
         # load model arch and state
         model_path = os.path.join(local_path, weights_filename)
         logger.info("Loading a model from {}".format(local_path))
@@ -54,7 +64,7 @@ class ModelAdapter(dl.BaseModelAdapter):
 
             Virtual method - need to implement
 
-            the function is called in save_to_snapshot which first save locally and then uploads to snapshot entity
+            the function is called in save_to_model which first save locally and then uploads to model entity
 
         :param local_path: `str` directory path in local FileSystem
         """
@@ -63,7 +73,7 @@ class ModelAdapter(dl.BaseModelAdapter):
         self.configuration['weights_filename'] = weights_filename
 
     def train(self, data_path, output_path, **kwargs):
-        """ Train the model according to data in local_path and save the snapshot to dump_path
+        """ Train the model according to data in local_path and save the model to dump_path
 
             Virtual method - need to implement
         :param data_path: `str` local File System path to where the data was downloaded and converted at
@@ -101,17 +111,17 @@ class ModelAdapter(dl.BaseModelAdapter):
         # Prepare the data #
         ####################
         train_dataset = DatasetGeneratorTorch(data_path=os.path.join(data_path, 'train'),
-                                              dataset_entity=self.snapshot.dataset,
+                                              dataset_entity=self.model_entity.dataset,
                                               annotation_type=dl.AnnotationType.CLASSIFICATION,
                                               transforms=data_transforms['train'],
-                                              id_to_label_map=self.snapshot.id_to_label_map,
-                                              class_balancing=False
+                                              id_to_label_map=self.model_entity.id_to_label_map,
+                                              class_balancing=True
                                               )
         val_dataset = DatasetGeneratorTorch(data_path=os.path.join(data_path, 'validation'),
-                                            dataset_entity=self.snapshot.dataset,
+                                            dataset_entity=self.model_entity.dataset,
                                             annotation_type=dl.AnnotationType.CLASSIFICATION,
                                             transforms=data_transforms['val'],
-                                            id_to_label_map=self.snapshot.id_to_label_map,
+                                            id_to_label_map=self.model_entity.id_to_label_map,
                                             )
 
         dataloaders = {'train': DataLoader(train_dataset,
@@ -199,14 +209,16 @@ class ModelAdapter(dl.BaseModelAdapter):
                 logger.info(
                     f'Epoch {epoch}/{num_epochs} - {phase} - Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.4f}, Duration {(time.time() - epoch_time):.2f}')
                 # deep copy the model
-                self.snapshot.add_metric_samples(samples=dl.SnapshotMetricSample(figure='loss',
-                                                                                 legend=phase,
-                                                                                 x=epoch,
-                                                                                 y=epoch_loss))
-                self.snapshot.add_metric_samples(samples=dl.SnapshotMetricSample(figure='acc',
-                                                                                 legend=phase,
-                                                                                 x=epoch,
-                                                                                 y=epoch_acc))
+                self.model_entity.add_log_samples(samples=dl.LogSample(figure='loss',
+                                                                       legend=phase,
+                                                                       x=epoch,
+                                                                       y=epoch_loss),
+                                                  dataset_id=self.model_entity.dataset_id)
+                self.model_entity.add_log_samples(samples=dl.LogSample(figure='accuracy',
+                                                                       legend=phase,
+                                                                       x=epoch,
+                                                                       y=epoch_acc),
+                                                  dataset_id=self.model_entity.dataset_id)
                 self.metrics['history'].append({'phase': phase,
                                                 'epoch': epoch,
                                                 'loss': epoch_loss,
@@ -219,6 +231,9 @@ class ModelAdapter(dl.BaseModelAdapter):
                         best_model_wts = copy.deepcopy(self.model.state_dict())
                         logger.info(
                             f'Validation loss decreased ({best_loss:.6f} --> {epoch_loss:.6f}).  Saving model ...')
+                        torch.save(self.model, os.path.join(output_path, 'best.pth'))
+                        # self.model_entity.bucket.sync(local_path=output_path)
+
                     else:
                         not_improving_epochs += 1
                     if not_improving_epochs > patience_epochs:
@@ -242,45 +257,74 @@ class ModelAdapter(dl.BaseModelAdapter):
         # load best model weights
         self.model.load_state_dict(best_model_wts)
 
-        #############
-        # Confusion #
-        #############
-        self.metrics['confusion'] = dict()
-        y_true_total = list()
-        y_pred_total = list()
-        labels = list(train_dataset.id_to_label_map.values())
-        confusion_dict = dict()
-        for phase in ['train', 'val']:
-            y_true = list()
-            y_pred = list()
-            filepaths = list()
-            for batch in dataloaders[phase]:
-                xs = torch.stack(tuple(batch['image']), 0).to(self.device)
-                ys = torch.stack(tuple(batch['annotations']), 0).to(self.device).long().squeeze()
-                y_true.extend([train_dataset.id_to_label_map[int(y)] for y in ys])
-                with torch.set_grad_enabled(False):
-                    outputs = self.model(xs)
-                    _, preds = torch.max(outputs, 1)
-                y_pred.extend([train_dataset.id_to_label_map[int(l)] for l in preds])
-                filepaths.extend(batch['image_filepath'])
-            for t, p, file in zip(y_true, y_pred, filepaths):
-                if t not in confusion_dict:
-                    confusion_dict[t] = dict()
-                if p not in confusion_dict[t]:
-                    confusion_dict[t][p] = list()
-                confusion_dict[t][p].append(file)
-            s_true = pd.Series(y_true, name='Actual')
-            s_pred = pd.Series(y_pred, name='Predicted')
-            self.metrics['confusion'][phase] = pd.crosstab(s_true, s_pred).reindex(columns=labels,
-                                                                                   index=labels,
-                                                                                   fill_value=0)
-            y_true_total.extend(y_true)
-            y_pred_total.extend(y_pred)
-        s_true = pd.Series(y_true_total, name='Actual')
-        s_pred = pd.Series(y_pred_total, name='Predicted')
-        self.metrics['confusion']['overall'] = pd.crosstab(s_true, s_pred).reindex(columns=labels,
-                                                                                   index=labels,
-                                                                                   fill_value=0)
+        #####################
+        # Confusion Shebang #
+        #####################
+        try:
+            from dtlpy.utilities.reports import Report, FigOptions, ConfusionMatrix
+            from sklearn.metrics import confusion_matrix
+            import seaborn as sns
+
+            y_true_total = list()
+            y_pred_total = list()
+            labels = list(train_dataset.id_to_label_map.values())
+            colors = sns.color_palette("rocket", as_cmap=True)
+            report = Report(ncols=1, nrows=3)
+            for phase in ['train', 'val']:
+                y_true = list()
+                y_pred = list()
+                for batch in dataloaders[phase]:
+                    xs = batch['image'].to(self.device)
+                    ys = batch['annotations'].to(self.device)
+                    y_true.extend([train_dataset.id_to_label_map[int(y)] for y in ys])
+                    with torch.set_grad_enabled(False):
+                        outputs = self.model(xs)
+                        _, preds = torch.max(outputs, 1)
+                    y_pred.extend([train_dataset.id_to_label_map[int(l)] for l in preds])
+                y_true_total.extend(y_true)
+                y_pred_total.extend(y_pred)
+                data = confusion_matrix(y_true, y_pred,
+                                        labels=labels,
+                                        normalize='true')
+                color_map = colors(data)
+                href_map = [[self.model_entity.dataset.platform_url for _ in range(data.shape[0])] for _ in
+                            range(data.shape[0])]
+                confusion = ConfusionMatrix(title="Confusion",
+                                            labels=labels,
+                                            data=data,
+                                            color_map=color_map,
+                                            href_map=href_map,
+                                            options=FigOptions(rows_per_page=100,
+                                                               x_title="true",
+                                                               y_title="pred"))
+                if phase == 'train':
+                    confusion.title = "Train Confusion"
+                    report.add(fig=confusion, icol=0, irow=0)
+                else:
+                    confusion.title = "Train Confusion"
+                    report.add(fig=confusion, icol=0, irow=1)
+            data = confusion_matrix(y_true_total, y_pred_total,
+                                    labels=labels,
+                                    normalize='true')
+            color_map = colors(data)
+            href_map = [[self.model_entity.dataset.platform_url for _ in range(data.shape[0])] for _ in
+                        range(data.shape[0])]
+            confusion = ConfusionMatrix(title="Overall Confusion",
+                                        labels=labels,
+                                        data=data,
+                                        color_map=color_map,
+                                        href_map=href_map,
+                                        options=FigOptions(rows_per_page=100,
+                                                           x_title="true",
+                                                           y_title="pred"))
+            # Add the figures
+            report.add(fig=confusion, icol=0, irow=2)
+            # Upload the report to a dataset
+            report.upload(dataset=self.model_entity.dataset,
+                          remote_path="/reports",
+                          remote_name=f"confusion_model_{self.model_entity.id}.json")
+        except Exception:
+            logger.warning('Failed creating shebang confusion report! Continue without...')
 
     def convert_from_dtlpy(self, data_path, **kwargs):
         """ Convert Dataloop structure data to model structured
@@ -297,6 +341,13 @@ class ModelAdapter(dl.BaseModelAdapter):
         ...
 
 
+def train():
+    adapter = ModelAdapter()
+    model = dl.models.get(model_id='63231d9982533076a48c685d')
+    adapter.load_from_model(model)
+    adapter.train_model(model)
+
+
 def _get_imagenet_label_json():
     import json
     with open('imagenet_labels.json', 'r') as fh:
@@ -304,56 +355,73 @@ def _get_imagenet_label_json():
     return list(labels.values())
 
 
-def model_creation(project_name, env: str = 'prod'):
-    dl.setenv(env)
-    project = dl.projects.get(project_name)
+def package_creation(project: dl.Project):
+    metadata = dl.Package.get_ml_metadata(cls=ModelAdapter,
+                                          default_configuration={'weights_filename': 'model.pth',
+                                                                 'input_size': 256},
+                                          output_type=dl.AnnotationType.CLASSIFICATION,
+                                          )
+    module = dl.PackageModule.from_entry_point(entry_point='resnet_adapter.py')
+    package = project.packages.push(package_name='resnet',
+                                    src_path=os.getcwd(),
+                                    # description='Global Dataloop ResNet implemented in pytorch',
+                                    is_global=True,
+                                    package_type='ml',
+                                    codebase=dl.GitCodebase(git_url='https://github.com/dataloop-ai/pytorch_adapters',
+                                                            git_tag='mgmt3'),
+                                    modules=[module],
+                                    service_config={
+                                        'runtime': dl.KubernetesRuntime(pod_type=dl.INSTANCE_CATALOG_GPU_K80_S,
+                                                                        runner_image='gcr.io/viewo-g/modelmgmt/resnet:0.0.7',
+                                                                        autoscaler=dl.KubernetesRabbitmqAutoscaler(
+                                                                            min_replicas=0,
+                                                                            max_replicas=1),
+                                                                        concurrency=1).to_json()},
+                                    metadata=metadata)
+    # package.metadata = {'system': {'ml': {'defaultConfiguration': {'weights_filename': 'model.pth',
+    #                                                                'input_size': 256},
+    #                                       'outputType': dl.AnnotationType.CLASSIFICATION,
+    #                                       'tags': ['torch'], }}}
+    # package = package.update()
+    s = package.services.list().items[0]
+    s.package_revision = package.version
+    s.versions['dtlpy'] = '1.63.2'
+    s.update(True)
+    return package
 
-    codebase = dl.GitCodebase(git_url='https://github.com/dataloop-ai/pytorch_adapters',
-                              git_tag='master')
-    model = project.models.create(model_name='ResNet',
-                                  description='Global Dataloop ResNet implemeted in pytorch',
-                                  output_type=dl.AnnotationType.CLASSIFICATION,
+
+def model_creation(package: dl.Package, resnet_ver='50'):
+    # bucket = dl.buckets.create(dl.BucketType.GCS,
+    #                            gcs_project_name='viewo-main',
+    #                            gcs_bucket_name='model-mgmt-snapshots',
+    #                            gcs_prefix='ResNet{}'.format(resnet_ver))
+    # artifact = dl.LocalArtifact(path=os.getcwd())
+
+    model = package.models.create(model_name='pretrained-resnet{}'.format(resnet_ver),
+                                  description='resnset{} pretrained on imagenet'.format(resnet_ver),
+                                  tags=['pretrained', 'imagenet'],
+                                  dataset_id=None,
                                   scope='public',
-                                  codebase=codebase,
-                                  tags=['torch'],
-                                  default_configuration={
-                                      'weights_filename': 'model.pth',
-                                      'input_size': 256,
-                                  },
-                                  default_runtime=dl.KubernetesRuntime(pod_type=dl.INSTANCE_CATALOG_GPU_K80_S,
-                                                                       runner_image='gcr.io/viewo-g/modelmgmt/resnet:0.0.6',
-                                                                       autoscaler=dl.KubernetesRabbitmqAutoscaler(
-                                                                           min_replicas=0,
-                                                                           max_replicas=1),
-                                                                       concurrency=1),
-                                  entry_point='resnet_adapter.py')
+                                  # scope='project',
+                                  model_artifacts=[dl.LinkArtifact(
+                                      url='https://storage.googleapis.com/model-mgmt-snapshots/ResNet50/model.pth',
+                                      filename='model.pth')],
+                                  status='trained',
+                                  configuration={'weights_filename': 'model.pth',
+                                                 'batch_size': 16,
+                                                 'num_epochs': 10},
+                                  project_id=project.id,
+                                  labels=_get_imagenet_label_json(),
+                                  )
+    # artifact = model.artifacts.upload(filepath=r"C:\Users\Shabtay\Downloads\New folder\*")
     return model
 
 
-def snapshot_creation(project_name, model: dl.Model, env: str = 'prod', resnet_ver='50'):
+if __name__ == "__main__":
+    env = 'prod'
+    project_name = 'DataloopModels'
     dl.setenv(env)
     project = dl.projects.get(project_name)
-    bucket = dl.buckets.create(dl.BucketType.GCS,
-                               gcs_project_name='viewo-main',
-                               gcs_bucket_name='model-mgmt-snapshots',
-                               gcs_prefix='ResNet{}'.format(resnet_ver))
-    snapshot = model.snapshots.create(snapshot_name='pretrained-resnet{}'.format(resnet_ver),
-                                      description='resnset{} pretrained on imagenet'.format(resnet_ver),
-                                      tags=['pretrained', 'imagenet'],
-                                      dataset_id=None,
-                                      scope='public',
-                                      # status='trained',
-                                      configuration={'weights_filename': 'model.pth',
-                                                     'classes_filename': 'classes.json'},
-                                      project_id=project.id,
-                                      bucket=bucket,
-                                      labels=_get_imagenet_label_json()
-                                      )
-    return snapshot
-
-
-def model_and_snapshot_creation(project_name, env: str = 'prod', resnet_ver='50'):
-    model = model_creation(project_name, env=env)
-    print("Model : {} - {} created".format(model.name, model.id))
-    snapshot = snapshot_creation(project_name, model=model, env=env, resnet_ver=resnet_ver)
-    print("Snapshot : {} - {} created".format(snapshot.name, snapshot.id))
+    # package = project.packages.get('resnet')
+    # package.artifacts.list()
+    # model_creation(package=package)
